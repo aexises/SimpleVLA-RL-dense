@@ -64,6 +64,23 @@ from codetiming import Timer
 import multiprocessing
 from multiprocessing import Process, Queue
 
+SUBGOAL_NUMERIC_KEYS = [
+    "subgoal_supported",
+    "subgoal_phase_id",
+    "subgoal_progress",
+    "subgoal_best_progress",
+    "subgoal_positive_delta",
+    "subgoal_phase_completed",
+    "reward_env",
+    "reward_subgoal",
+    "reward_phase",
+    "reward_terminal",
+    "reward_smoothness",
+    "reward_total",
+    "success",
+    "action_delta_l2",
+]
+
 __all__ = ['RobHFRollout']
 
 # Environment initialization lock for Robotwin
@@ -230,6 +247,35 @@ def encode_obs(observation):
     """Post-Process Observation for robotwin 2.0"""
     return observation
 
+
+def _get_subgoal_config(config):
+    if hasattr(config, "get"):
+        return config.get("reward_subgoal", None)
+    return None
+
+
+def _subgoal_enabled(config):
+    subgoal_config = _get_subgoal_config(config)
+    if subgoal_config is None or not hasattr(subgoal_config, "get"):
+        return False
+    return bool(subgoal_config.get("enabled", False))
+
+
+def _empty_subgoal_metrics():
+    return {key: 0.0 for key in SUBGOAL_NUMERIC_KEYS}
+
+
+def _accumulate_subgoal_metrics(total, subgoal_info, reward_parts):
+    for key, value in subgoal_info.items():
+        if key == "phase_name":
+            continue
+        if key in ("subgoal_phase_id", "subgoal_progress", "subgoal_best_progress", "success", "subgoal_supported"):
+            total[key] = float(value)
+        else:
+            total[key] += float(value)
+    for key, value in reward_parts.items():
+        total[key] += float(value)
+
 class RobotwinEnvWrapper:
     """Thread-safe wrapper for Robotwin environment (supports both 1.0 and 2.0)"""
     def __init__(self, task_name, trial_id, trial_seed, config, version="1.0"):
@@ -381,6 +427,20 @@ def env_worker(task_name, task_id, trial_id, config, input_queue, output_queue, 
         'finish_step': 0
     })
     
+    subgoal_engine = None
+    task_metadata = {
+        "task_name": task_name,
+        "task_suite_name": task_name,
+        "task_id": task_id,
+        "trial_id": trial_id,
+        "instruction": task_description,
+        "task_description": task_description,
+    }
+    if _subgoal_enabled(config):
+        from verl.utils.subgoal_reward import LiberoSubgoalRewardEngine
+
+        subgoal_engine = LiberoSubgoalRewardEngine(_get_subgoal_config(config))
+
     active = True
     complete = False
     finish_step = 0
@@ -393,11 +453,27 @@ def env_worker(task_name, task_id, trial_id, config, input_queue, output_queue, 
             break
         
         step_images = []
+        subgoal_metrics = _empty_subgoal_metrics() if subgoal_engine is not None else None
         for i in range(len(action)):
             a = action[i]
             normalized_action = normalize_gripper_action(a, binarize=True)
             inverted_action = invert_gripper_action(normalized_action)
+            prev_obs = obs
             obs, reward, done, info = env.step(inverted_action.tolist())
+
+            if subgoal_engine is not None:
+                subgoal_info, reward_parts = subgoal_engine.step(
+                    env_index=0,
+                    env=env,
+                    obs=prev_obs,
+                    next_obs=obs,
+                    action=inverted_action,
+                    env_reward=reward,
+                    done=done,
+                    info=info,
+                    task_metadata=task_metadata,
+                )
+                _accumulate_subgoal_metrics(subgoal_metrics, subgoal_info, reward_parts)
             
             if is_valid:
                 img = obs["agentview_image"][::-1, ::-1]
@@ -417,6 +493,8 @@ def env_worker(task_name, task_id, trial_id, config, input_queue, output_queue, 
             'finish_step': finish_step,
             'valid_images': step_images.copy() if is_valid else []
         }
+        if subgoal_metrics is not None:
+            output_data["subgoal_metrics"] = subgoal_metrics
         output_queue.put(output_data)
 
 # ================ Main Rollout Class ================
@@ -781,6 +859,7 @@ class RobHFRollout(BaseRollout):
         batch_size = task_id.size(0)
         is_valid = meta_info.get('n_samples') is None
         global_steps = meta_info.get('global_steps', 0) if is_valid else 0
+        subgoal_logging_enabled = _subgoal_enabled(self.config)
         
         processes = []
         input_queues = []
@@ -842,12 +921,12 @@ class RobHFRollout(BaseRollout):
                 "action": actions,
                 "step": step
             }
-            vla_history.append(step_data)
             
             for idx in active_indices:
                 input_queues[idx].put(actions[idx])
             
             new_inputs = inputs.copy()
+            subgoal_step_metrics = [_empty_subgoal_metrics() for _ in range(batch_size)] if subgoal_logging_enabled else None
             for idx in active_indices:
                 result = output_queues[idx].get(timeout=30)
                 assert result['type'] == 'step'
@@ -855,9 +934,17 @@ class RobHFRollout(BaseRollout):
                 task_records[idx]['active'] = result['active']
                 task_records[idx]['complete'] = result['complete']
                 task_records[idx]['finish_step'] = result['finish_step']
+                if subgoal_step_metrics is not None and "subgoal_metrics" in result:
+                    subgoal_step_metrics[idx] = result["subgoal_metrics"]
                 if is_valid:
                     valid_video[task_records[idx]['task_file_name']].extend(result['valid_images'])
             
+            if subgoal_step_metrics is not None:
+                device = vla_output["responses"].device
+                for key in SUBGOAL_NUMERIC_KEYS:
+                    values = [metrics.get(key, 0.0) for metrics in subgoal_step_metrics]
+                    step_data[key] = torch.tensor(values, dtype=torch.float32, device=device)
+            vla_history.append(step_data)
             inputs = new_inputs
             step += self.config.action_chunks_len
         
@@ -898,6 +985,11 @@ class RobHFRollout(BaseRollout):
         if self.config.use_proprio and "robotwin" in self.config.task_suite_name:
             batch["proprio"] = []
             key_names.append("proprio")
+
+        for key in SUBGOAL_NUMERIC_KEYS:
+            if vla_history and key in vla_history[0]:
+                batch[key] = []
+                key_names.append(key)
         
         for k in key_names:
             for h in vla_history:

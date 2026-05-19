@@ -159,7 +159,7 @@ def compute_advantage(data: DataProto, gamma, lam, adv_estimator, config):
         
     elif adv_estimator == 'grpo':
         token_level_rewards = data.batch['token_level_rewards']
-        index = data.non_tensor_batch['uid']
+        index = data.non_tensor_batch.get('group_id', data.non_tensor_batch['uid'])
         responses = data.batch['responses']
         response_length = responses.size(1) *  responses.size(2)
         finish_step = data.batch['finish_step'] * config.actor_rollout_ref.model.action_token_len 
@@ -536,6 +536,15 @@ class RayTrainer(object):
  
                         newbatch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(newbatch.batch))],
                                                              dtype=object)
+                        task_ids = newbatch.batch['task_id'].detach().cpu().reshape(len(newbatch), -1)[:, 0].tolist()
+                        task_suites = newbatch.non_tensor_batch.get(
+                            'task_suite_name',
+                            np.array([self.config.data.task_suite_name for _ in range(len(newbatch))], dtype=object)
+                        )
+                        newbatch.non_tensor_batch['group_id'] = np.array(
+                            [f"{task_suites[i]}:{int(task_ids[i])}" for i in range(len(newbatch))],
+                            dtype=object
+                        )
 
                         batch_lst = sum([[newbatch[i:i + 1] for _ in range(n_samples)] for i in range(len(newbatch))],
                                         [])

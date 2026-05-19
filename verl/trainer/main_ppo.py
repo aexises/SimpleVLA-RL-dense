@@ -35,6 +35,28 @@ class RobRewardManager():
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.config=config
 
+    def _subgoal_config(self):
+        reward_cfg = self.config.get("reward", {}) if hasattr(self.config, "get") else {}
+        if not hasattr(reward_cfg, "get"):
+            return {}
+        return reward_cfg.get("subgoal", {})
+
+    def _subgoal_dense_tokens(self, data: DataProto):
+        if "reward_total" not in data.batch.keys():
+            return None
+
+        dense_values = data.batch["reward_total"]
+        dense_tokens = torch.zeros_like(data.batch['responses'], dtype=torch.float32).reshape((data.batch['responses'].shape[0], -1))
+        response_tokens_per_step = data.batch['responses'].size(-1)
+        valid_response_length = data.batch['finish_step'] * self.config.actor_rollout_ref.model.action_token_len
+        for i in range(dense_tokens.shape[0]):
+            valid_length = int(valid_response_length[i].item())
+            for step in range(dense_values.shape[1]):
+                token_index = min((step + 1) * response_tokens_per_step - 1, dense_tokens.shape[1] - 1)
+                if token_index < valid_length:
+                    dense_tokens[i, token_index] += dense_values[i, step]
+        return dense_tokens
+
     def verify(self, data):
         completes = data.batch['complete'].tolist()
         batch_size = data.batch['responses'].size(0)
@@ -52,6 +74,14 @@ class RobRewardManager():
         reward_metrics['all'] = data.batch['acc'].mean().item()
         format_metrics['all'] = data.batch['format_correctness'].mean().item()
         reward_format_metrics['all'] = data.batch['acc'].mean().item()
+
+        subgoal_cfg = self._subgoal_config()
+        if bool(subgoal_cfg.get("enabled", False)) and bool(subgoal_cfg.get("log", True)):
+            for key in ("subgoal_progress", "subgoal_best_progress", "subgoal_positive_delta", "reward_total"):
+                if key in data.batch.keys():
+                    reward_metrics[f"subgoal/{key}"] = data.batch[key].float().mean().item()
+            if "subgoal_phase_completed" in data.batch.keys():
+                reward_metrics["subgoal/phase_completed"] = data.batch["subgoal_phase_completed"].float().sum().item() / batch_size
 
         return score, reward_metrics, format_metrics, reward_format_metrics
 
@@ -92,6 +122,20 @@ class RobRewardManager():
             
             reward_metrics['verifier'] = reward_tensor_dict['gt_scores'].sum(dim=1).mean().item()
             reward_tensor += self.config.verifier.reward_coef * reward_tensor_dict['gt_scores']
+
+        subgoal_cfg = self._subgoal_config()
+        if bool(subgoal_cfg.get("enabled", False)) and "reward_total" in data.batch.keys():
+            dense_reward = self._subgoal_dense_tokens(data)
+            if dense_reward is not None:
+                reward_tensor_dict['subgoal_scores'] = dense_reward
+                reward_metrics['subgoal_dense'] = dense_reward.sum(dim=1).mean().item()
+                mode = str(subgoal_cfg.get("mode", "log_only"))
+                if mode == "replace":
+                    reward_tensor = dense_reward.clone()
+                elif mode == "add":
+                    reward_tensor += dense_reward
+                elif mode != "log_only":
+                    raise ValueError(f"Unsupported reward.subgoal.mode: {mode}")
 
         reward_tensor_dict['all'] = reward_tensor
         reward_metrics['reward_all'] = reward_tensor.sum(dim=-1).mean(dim=0).item()

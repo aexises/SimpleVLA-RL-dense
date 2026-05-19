@@ -122,6 +122,7 @@ actor_rollout_ref:
     do_sample: True
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
+    reward_subgoal: ${reward.subgoal}
 
 critic:
   strategy: fsdp
@@ -170,6 +171,24 @@ verifier:
 #  timeout: 5
 #  num_processes: 64
   reward_coef: 5
+
+reward:
+  subgoal:
+    enabled: False
+    mode: log_only  # log_only | replace | add
+    log: True
+    unsupported_task_behavior: terminal_only  # terminal_only | error
+    use_best_progress: True
+    clip_dense_reward: 0.05
+    weights:
+      subgoal_progress: 0.2
+      phase_transition: 0.05
+      terminal_success: 1.0
+      smoothness: 0.0
+    thresholds:
+      reach_distance: 0.05
+      target_distance: 0.06
+      lift_height: 0.08
 
 reward_model:
   enable: True
