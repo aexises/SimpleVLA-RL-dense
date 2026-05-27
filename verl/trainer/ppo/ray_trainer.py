@@ -17,7 +17,9 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import resource
 import statistics
+import sys
 from collections import defaultdict, Counter
 from dataclasses import dataclass, field
 from enum import Enum
@@ -37,6 +39,22 @@ from verl.trainer.ppo import core_algos
 from verl.utils.dataset.rob_dataset import BufferedDataLoader
 
 WorkerType = Type[Worker]
+
+
+def _log_process_memory(label):
+    """Log driver process RSS and CUDA allocation without external dependencies."""
+    try:
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_mb = rss_kb / (1024 ** 2 if sys.platform == "darwin" else 1024)
+        cuda_msg = ""
+        if torch.cuda.is_available():
+            cuda_msg = (
+                f", cuda_allocated_mb={torch.cuda.memory_allocated() / 1024 ** 2:.1f}"
+                f", cuda_reserved_mb={torch.cuda.memory_reserved() / 1024 ** 2:.1f}"
+            )
+        print(f"[memory] {label}: maxrss_mb={rss_mb:.1f}{cuda_msg}", flush=True)
+    except Exception as e:
+        print(f"[memory] {label}: failed to read memory usage: {e}", flush=True)
 
 
 class Role(Enum):
@@ -556,10 +574,12 @@ class RayTrainer(object):
                         }
                         
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(prompts=gen_batch)
+                        _log_process_memory("driver after rollout generation")
                         
                         roll_batch = DataProto.concat(batch_lst)
                         #roll_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
                         roll_batch = roll_batch.union(gen_batch_output)
+                        _log_process_memory("driver after rollout union")
 
                     metrics['timing/gen'] += timer.last
                     
@@ -584,6 +604,7 @@ class RayTrainer(object):
                             print(f"before filtering: {len(roll_batch)}")
                             filtered_roll_batch = self.filter(roll_batch.batch['acc'].unsqueeze(1), roll_batch, n_samples)
                             print(f"after filtering: {len(filtered_roll_batch)}")
+                            _log_process_memory("driver after rollout filtering")
                     metrics['timing/acc&trunc_filter'] += timer.last
 
                     
@@ -672,7 +693,9 @@ class RayTrainer(object):
                         batch.meta_info['is_filtered'] = True
                         batch.meta_info['train_mode'] = False
                         actor_output = self.actor_rollout_wg.update_actor(batch)
+                        _log_process_memory("driver after actor update")
                         entropy_output = self.actor_rollout_wg.compute_entropy(data=batch)
+                        _log_process_memory("driver after entropy")
                     metrics['timing/update_actor'] = timer.last
                     actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                     entropy_output_metrics = reduce_metrics(entropy_output.meta_info['metrics'])

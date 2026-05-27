@@ -13,6 +13,7 @@
 # limitations under the License.
 import contextlib
 import os
+import sys
 import torch
 import torch.distributed
 from tensordict import TensorDict
@@ -54,6 +55,7 @@ from pathlib import Path
 import threading
 import queue
 import gc
+import resource
 from collections import defaultdict
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -90,6 +92,22 @@ OPENVLA_V01_SYSTEM_PROMPT = (
     "A chat between a curious user and an artificial intelligence assistant. "
     "The assistant gives helpful, detailed, and polite answers to the user's questions."
 )
+
+
+def _log_process_memory(label):
+    """Log process RSS and CUDA allocation without adding external dependencies."""
+    try:
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_mb = rss_kb / (1024 ** 2 if sys.platform == "darwin" else 1024)
+        cuda_msg = ""
+        if torch.cuda.is_available():
+            cuda_msg = (
+                f", cuda_allocated_mb={torch.cuda.memory_allocated() / 1024 ** 2:.1f}"
+                f", cuda_reserved_mb={torch.cuda.memory_reserved() / 1024 ** 2:.1f}"
+            )
+        print(f"[memory] {label}: maxrss_mb={rss_mb:.1f}{cuda_msg}", flush=True)
+    except Exception as e:
+        print(f"[memory] {label}: failed to read memory usage: {e}", flush=True)
 
 def crop_and_resize(image, crop_scale, batch_size):
     """
@@ -306,6 +324,14 @@ class RobotwinEnvWrapper:
                         episode_info_list = [self.env.get_info()]
                 except Exception as e:
                     print(f"****** IN thread: setup_demo ERROR {e} ******", flush=True)
+                    if self.env is not None:
+                        try:
+                            self.env.close_env(clear_cache=True)
+                        except Exception as close_error:
+                            print(f"****** IN thread: setup_demo cleanup ERROR {close_error} ******", flush=True)
+                        finally:
+                            self.env = None
+                            self.args = None
                     torch.cuda.empty_cache()
                     gc.collect()
                     self.env, self.args = get_robotwin2_task(self.task_name, self.config)
@@ -374,6 +400,9 @@ class RobotwinEnvWrapper:
                     self.env.close_env(clear_cache=True)
                 except Exception as e:
                     print(f"******IN env.close ERROR {e} ******", flush=True)
+                finally:
+                    self.env = None
+                    self.args = None
 
 # ================ Libero-specific functions ================
 
@@ -682,6 +711,7 @@ class RobHFRollout(BaseRollout):
     def _generate_minibatch_robotwin(self, prompts):
         """Generate minibatch for Robotwin using threading"""
         self.module.eval()
+        _log_process_memory("robotwin rollout start")
         meta_info = prompts.meta_info
         n_samples = meta_info.get('n_samples', 1)
         task_id = prompts.batch['task_id'].repeat_interleave(n_samples, dim=0)
@@ -772,7 +802,6 @@ class RobHFRollout(BaseRollout):
                 "input_ids": vla_output["input_ids"],
                 "attention_mask": vla_output["attention_mask"],
                 "pixel_values": vla_output["pixel_values"],
-                "action": actions,
                 "step": step
             }
             if vla_output.get("proprio") is not None:
@@ -829,6 +858,7 @@ class RobHFRollout(BaseRollout):
         
         torch.cuda.empty_cache()
         gc.collect()
+        _log_process_memory("robotwin rollout after cleanup")
         
         # Save validation videos
         if is_valid:
@@ -845,11 +875,14 @@ class RobHFRollout(BaseRollout):
         self.module.train()
         
         # Prepare output batch
-        return self._prepare_output_batch(vla_history, task_records, batch_size)
+        output_batch = self._prepare_output_batch(vla_history, task_records, batch_size)
+        _log_process_memory("robotwin rollout output prepared")
+        return output_batch
     
     def _generate_minibatch_libero(self, prompts):
         """Generate minibatch for Libero using multiprocessing"""
         self.module.eval()
+        _log_process_memory("libero rollout start")
         meta_info = prompts.meta_info
         n_samples = meta_info.get('n_samples', 1)
         task_id = prompts.batch['task_id'].repeat_interleave(n_samples, dim=0)
@@ -918,7 +951,6 @@ class RobHFRollout(BaseRollout):
                 "input_ids": vla_output["input_ids"],
                 "attention_mask": vla_output["attention_mask"],
                 "pixel_values": vla_output["pixel_values"],
-                "action": actions,
                 "step": step
             }
             
@@ -956,6 +988,8 @@ class RobHFRollout(BaseRollout):
                 p.terminate()
         
         torch.cuda.empty_cache()
+        gc.collect()
+        _log_process_memory("libero rollout after cleanup")
         
         if is_valid:
             for task_file, images in valid_video.items():
@@ -970,7 +1004,9 @@ class RobHFRollout(BaseRollout):
         
         self.module.train()
         
-        return self._prepare_output_batch(vla_history, task_records, batch_size)
+        output_batch = self._prepare_output_batch(vla_history, task_records, batch_size)
+        _log_process_memory("libero rollout output prepared")
+        return output_batch
     
     def _prepare_output_batch(self, vla_history, task_records, batch_size):
         """Prepare the output batch from VLA history"""
